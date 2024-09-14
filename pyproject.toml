@@ -1,3 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama"
+version = "0.0.1"
+dependencies = ["torch", "fairscale", "fire", "sentencepiece", "triton"]
+
+[project.urls]
+Homepage = "https://github.com/InfiniTensor/triton-llama"
+Issues = "https://github.com/InfiniTensor/triton-llama/issues"
+
 [tool.ruff]
 src = [".", "src"]
 
