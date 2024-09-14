@@ -1,10 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+from typing import List
+
 import fire
 
 from llama import Llama
-from typing import List
+
 
 def main(
     ckpt_dir: str,
@@ -28,7 +30,7 @@ def main(
         max_seq_len (int, optional): The maximum sequence length for input prompts. Defaults to 128.
         max_gen_len (int, optional): The maximum length of generated sequences. Defaults to 64.
         max_batch_size (int, optional): The maximum batch size for generating sequences. Defaults to 4.
-    """ 
+    """
     generator = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,

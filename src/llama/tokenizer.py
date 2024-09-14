@@ -7,12 +7,12 @@ from typing import List
 
 from sentencepiece import SentencePieceProcessor
 
-
 logger = getLogger()
 
 
 class Tokenizer:
     """tokenizing and encoding/decoding text using SentencePiece."""
+
     def __init__(self, model_path: str):
         """
         Initializes the Tokenizer with a SentencePiece model.
