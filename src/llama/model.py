@@ -8,6 +8,8 @@ from typing import Optional, Tuple
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
     ParallelEmbedding,
@@ -31,6 +33,32 @@ class ModelArgs:
     max_seq_len: int = 2048
 
 
+@triton.jit
+def rms_norm_kernel(x_ptr, y_ptr, w_ptr, stride, n, eps, BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)
+
+    y_ptr += row * stride
+    x_ptr += row * stride
+
+    rms = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for off in range(0, n, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        a = tl.load(x_ptr + cols, mask=cols < n, other=0.0).to(tl.float32)
+        rms += a * a
+    rms = tl.sqrt(tl.sum(rms) / n + eps)
+
+    for off in range(0, n, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n
+        w = tl.load(w_ptr + cols, mask=mask)
+        x = tl.load(
+            x_ptr + cols, mask=mask, other=0.0, eviction_policy="evict_first"
+        ).to(tl.float32)
+        x_hat = x / rms
+        y = x_hat * w
+        tl.store(y_ptr + cols, y, mask=mask)
+
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         """
@@ -49,19 +77,6 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
-        """
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
         """
         Forward pass through the RMSNorm layer.
@@ -73,8 +88,17 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        y = torch.empty_like(x)
+        x = x.view(-1, x.shape[-1])
+        m, n = x.shape
+        stride = x.stride(0)
+        w = self.weight
+        eps = self.eps
+        BLOCK_SIZE = 1024
+
+        rms_norm_kernel[(m,)](x, y, w, stride, n, eps, BLOCK_SIZE=BLOCK_SIZE)
+
+        return y
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
