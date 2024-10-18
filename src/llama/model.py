@@ -198,18 +198,18 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 @triton.jit
-def _load_helper(
+def _attention_load_helper(
     block_ptr,
-    first: tl.constexpr,
-    second: tl.constexpr,
-    pad: tl.constexpr,
+    FIRST: tl.constexpr,
+    SECOND: tl.constexpr,
+    PADDING: tl.constexpr,
 ):
-    if first and second:
-        block = tl.load(block_ptr, boundary_check=(0, 1), padding_option=pad)
-    elif first:
-        block = tl.load(block_ptr, boundary_check=(0,), padding_option=pad)
-    elif second:
-        block = tl.load(block_ptr, boundary_check=(1,), padding_option=pad)
+    if FIRST and SECOND:
+        block = tl.load(block_ptr, boundary_check=(0, 1), padding_option=PADDING)
+    elif FIRST:
+        block = tl.load(block_ptr, boundary_check=(0,), padding_option=PADDING)
+    elif SECOND:
+        block = tl.load(block_ptr, boundary_check=(1,), padding_option=PADDING)
     else:
         block = tl.load(block_ptr)
 
@@ -218,124 +218,85 @@ def _load_helper(
 
 @triton.jit
 def _attention_kernel_inner(
-    acc,
-    l_i,
-    m_i,
     q,
     k_block_ptr,
     v_block_ptr,
-    start_m,
-    actual_seq_lens_k,
-    actual_seq_lens_q,
+    acc,
+    m_i,
+    l_i,
+    seq_len_q,
+    seq_len_k,
     block_min,
     block_max,
-    offs_n_causal,
-    masked_blocks,
-    n_extra_tokens,
-    IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_N: tl.constexpr,
     OFFS_M: tl.constexpr,
     OFFS_N: tl.constexpr,
-    PRE_LOAD_V: tl.constexpr,
-    MASK_STEPS: tl.constexpr,
-    PADDED_HEAD: tl.constexpr,
+    PAD_HEAD: tl.constexpr,
+    APPLY_MASKING: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
 ):
-    for start_n in range(block_min, block_max, BLOCK_N):
-        k = _load_helper(
-            k_block_ptr, PADDED_HEAD, MASK_STEPS and (n_extra_tokens != 0), "zero"
-        )
-        if PRE_LOAD_V:
-            v = _load_helper(
-                v_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero"
-            )
-        qk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        # TODO: This can be optimized to only be true for the padded block.
-        if MASK_STEPS:
-            if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
-                boundary_m = tl.full((BLOCK_M,), actual_seq_lens_k, dtype=tl.int32)
-                size_n = start_n + OFFS_N[None, :]
-                mask = size_n < boundary_m[:, None]
-                qk = tl.where(mask, qk, float("-inf"))
+    for off_n in range(block_min, block_max, BLOCK_SIZE_N):
+        k = _attention_load_helper(k_block_ptr, PAD_HEAD, APPLY_MASKING, "zero")
+        qk = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        if APPLY_MASKING and off_n + BLOCK_SIZE_N == block_max:
+            boundary = tl.full((BLOCK_SIZE_M,), seq_len_k, dtype=tl.int32)
+            mask = off_n + OFFS_N[None, :] < boundary[:, None]
+            qk = tl.where(mask, qk, float("-inf"))
         if IS_CAUSAL:
-            causal_boundary = start_n + offs_n_causal
+            causal_offs_n = OFFS_N + (seq_len_q - seq_len_k)
+            causal_boundary = off_n + causal_offs_n
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             qk = tl.where(causal_mask, qk, float("-inf"))
+
         qk += tl.dot(q, k)
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
-        p = tl.math.exp2(qk)
-
+        qk -= m_ij[:, None]
+        p = tl.exp2(qk)
         l_ij = tl.sum(p, 1)
-        alpha = tl.math.exp2(m_i - m_ij)
-        acc = acc * alpha[:, None]
-        if not PRE_LOAD_V:
-            v = _load_helper(
-                v_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero"
-            )
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-        acc += tl.dot(p.to(v_block_ptr.type.element_ty), v)
-        v_block_ptr = tl.advance(v_block_ptr, (BLOCK_N, 0))
-        k_block_ptr = tl.advance(k_block_ptr, (0, BLOCK_N))
 
-    return acc, l_i, m_i
+        v = _attention_load_helper(v_block_ptr, APPLY_MASKING, PAD_HEAD, "zero")
+        alpha = tl.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_block_ptr.type.element_ty), v)
+        m_i = m_ij
+        l_i = l_i * alpha + l_ij
+
+        v_block_ptr = tl.advance(v_block_ptr, (BLOCK_SIZE_N, 0))
+        k_block_ptr = tl.advance(k_block_ptr, (0, BLOCK_SIZE_N))
+
+    return acc, m_i, l_i
 
 
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_M": 256, "BLOCK_N": 64, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=8,
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128}, num_stages=4, num_warps=8
         ),
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_stages=4, num_warps=8
         ),
         triton.Config(
-            {"BLOCK_M": 256, "BLOCK_N": 128, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=8,
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128}, num_stages=4, num_warps=4
         ),
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "PRE_LOAD_V": True},
-            num_stages=1,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_stages=4, num_warps=4
         ),
         triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64}, num_stages=4, num_warps=8
         ),
         triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 32, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=8,
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32}, num_stages=4, num_warps=8
         ),
     ],
-    key=["IS_CAUSAL", "BLOCK_DMODEL"],
+    key=["EMB_DIM", "IS_CAUSAL"],
 )
 @triton.jit
 def attention_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
-    sm_scale,
-    l_ptr,
     o_ptr,
     q_stride_z,
     q_stride_h,
@@ -353,229 +314,176 @@ def attention_kernel(
     o_stride_h,
     o_stride_m,
     o_stride_n,
-    HQ: tl.constexpr,
-    HK: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL: tl.constexpr,
-    MAX_SEQ_LENS_Q: tl.constexpr,
-    MAX_SEQ_LENS_K: tl.constexpr,
+    sm_scale,
+    ACTUAL_EMB_DIM: tl.constexpr,
+    NUM_HEADS_Q: tl.constexpr,
+    NUM_HEADS_K: tl.constexpr,
+    SEQ_LEN_Q: tl.constexpr,
+    SEQ_LEN_K: tl.constexpr,
+    EMB_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    PRE_LOAD_V: tl.constexpr,
-    BATCH_SIZE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
+    off_m = tl.program_id(0)
     off_h_q = tl.program_id(1)
     off_z = tl.program_id(2)
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
 
-    cu_seq_lens_q_start = 0
-    cu_seq_lens_k_start = 0
-    seq_lens_q = MAX_SEQ_LENS_Q
-    seq_lens_k = MAX_SEQ_LENS_K
+    offs_m_start = off_m * BLOCK_SIZE_M
+    offs_m_end = offs_m_start + BLOCK_SIZE_M
+    offs_m = offs_m_start + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
 
-    n_blocks = tl.cdiv(seq_lens_k, BLOCK_N)
+    num_blocks = tl.cdiv(SEQ_LEN_K, BLOCK_SIZE_N)
+
     if IS_CAUSAL:
-        n_blocks_seq_lens = tl.cdiv(
-            (start_m + 1) * BLOCK_M + seq_lens_k - seq_lens_q, BLOCK_N
-        )
-        n_blocks = min(n_blocks, n_blocks_seq_lens)
+        num_blocks_adjusted = tl.cdiv(offs_m_end + SEQ_LEN_K - SEQ_LEN_Q, BLOCK_SIZE_N)
+        num_blocks = tl.minimum(num_blocks, num_blocks_adjusted)
 
-        if n_blocks <= 0:
-            o_offset = (
-                off_z * o_stride_z
-                + cu_seq_lens_q_start * o_stride_m
-                + off_h_q * o_stride_h
-            )
+        if num_blocks <= 0:
+            o_off = off_z * o_stride_z + off_h_q * o_stride_h
             o_block_ptr = tl.make_block_ptr(
-                base=o_ptr + o_offset,
-                shape=(seq_lens_q, BLOCK_DMODEL),
+                base=o_ptr + o_off,
+                shape=(SEQ_LEN_Q, EMB_DIM),
                 strides=(o_stride_m, o_stride_n),
-                offsets=(start_m * BLOCK_M, 0),
-                block_shape=(BLOCK_M, BLOCK_DMODEL),
+                offsets=(offs_m_start, 0),
+                block_shape=(BLOCK_SIZE_M, EMB_DIM),
                 order=(1, 0),
             )
-
-            acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=o_ptr.type.element_ty)
-            tl.store(o_block_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0, 1))
-            l_ptrs = (
-                l_ptr + off_z * HQ * MAX_SEQ_LENS_Q + off_h_q * MAX_SEQ_LENS_Q + offs_m
+            tl.store(
+                o_block_ptr,
+                tl.zeros((BLOCK_SIZE_M, EMB_DIM), dtype=o_ptr.type.element_ty),
+                boundary_check=(0, 1),
             )
-            tl.store(l_ptrs, tl.full((BLOCK_M,), value=float("inf"), dtype=tl.float32))
 
-            # TODO: Should dropout and return encoded softmax be handled here too?
             return
 
-    GROUP_SIZE: tl.constexpr = HQ // HK
-    if GROUP_SIZE != 1:
-        off_h_k = off_h_q // GROUP_SIZE
-    else:
-        off_h_k = off_h_q
+    GROUP_SIZE: tl.constexpr = NUM_HEADS_Q // NUM_HEADS_K
+    off_h_k = off_h_q // GROUP_SIZE
 
-    n_extra_tokens = 0
-    if seq_lens_k < BLOCK_N:
-        n_extra_tokens = BLOCK_N - seq_lens_k
-    elif seq_lens_k % BLOCK_N:
-        n_extra_tokens = seq_lens_k % BLOCK_N
-    PADDED_HEAD: tl.constexpr = ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL
-
-    q_offset = (
-        off_z * q_stride_z + off_h_q * q_stride_h + cu_seq_lens_q_start * q_stride_m
-    )
+    q_off = off_z * q_stride_z + off_h_q * q_stride_h
     q_block_ptr = tl.make_block_ptr(
-        base=q_ptr + q_offset,
-        shape=(seq_lens_q, ACTUAL_BLOCK_DMODEL),
+        base=q_ptr + q_off,
+        shape=(SEQ_LEN_Q, ACTUAL_EMB_DIM),
         strides=(q_stride_m, q_stride_k),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        offsets=(offs_m_start, 0),
+        block_shape=(BLOCK_SIZE_M, EMB_DIM),
         order=(1, 0),
     )
-    k_offset = (
-        off_z * k_stride_z + off_h_k * k_stride_h + cu_seq_lens_k_start * k_stride_n
-    )
+    k_off = off_z * k_stride_z + off_h_k * k_stride_h
     k_block_ptr = tl.make_block_ptr(
-        base=k_ptr + k_offset,
-        shape=(ACTUAL_BLOCK_DMODEL, seq_lens_k),
+        base=k_ptr + k_off,
+        shape=(ACTUAL_EMB_DIM, SEQ_LEN_K),
         strides=(k_stride_k, k_stride_n),
         offsets=(0, 0),
-        block_shape=(BLOCK_DMODEL, BLOCK_N),
+        block_shape=(EMB_DIM, BLOCK_SIZE_N),
         order=(0, 1),
     )
-    v_offset = (
-        off_z * v_stride_z + off_h_k * v_stride_h + cu_seq_lens_k_start * v_stride_k
-    )
+    v_off = off_z * v_stride_z + off_h_k * v_stride_h
     v_block_ptr = tl.make_block_ptr(
-        base=v_ptr + v_offset,
-        shape=(seq_lens_k, ACTUAL_BLOCK_DMODEL),
+        base=v_ptr + v_off,
+        shape=(SEQ_LEN_K, ACTUAL_EMB_DIM),
         strides=(v_stride_k, v_stride_n),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        block_shape=(BLOCK_SIZE_N, EMB_DIM),
         order=(1, 0),
     )
 
-    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
-    l_i = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
-    qk_scale = sm_scale * 1.44269504089
-    q = _load_helper(q_block_ptr, True, PADDED_HEAD, "zero")
-    q = (q * qk_scale).to(q_block_ptr.type.element_ty)
+    PAD_HEAD: tl.constexpr = ACTUAL_EMB_DIM != EMB_DIM
 
-    padded_block_k = n_extra_tokens != 0
-    is_modulo_mn = not padded_block_k and (seq_lens_q % BLOCK_M == 0)
+    q = (
+        _attention_load_helper(q_block_ptr, True, PAD_HEAD, "zero")
+        * sm_scale
+        * 1.44269504089
+    ).to(q_block_ptr.type.element_ty)
+
+    num_extra_tokens = 0
+    if SEQ_LEN_K < BLOCK_SIZE_N:
+        num_extra_tokens = BLOCK_SIZE_N - SEQ_LEN_K
+    elif SEQ_LEN_K % BLOCK_SIZE_N:
+        num_extra_tokens = SEQ_LEN_K % BLOCK_SIZE_N
+    pad_block_k = num_extra_tokens != 0
     if IS_CAUSAL:
-        masked_blocks = BLOCK_M // BLOCK_N + (not is_modulo_mn)
+        is_modulo_mn = not pad_block_k and (SEQ_LEN_Q % BLOCK_SIZE_M == 0)
+        masked_blocks = BLOCK_SIZE_M // BLOCK_SIZE_N + (not is_modulo_mn)
     else:
-        masked_blocks = padded_block_k
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
+        masked_blocks = pad_block_k
+    masked_blocks = min(masked_blocks, num_blocks)
+    num_full_blocks = num_blocks - masked_blocks
+
+    acc = tl.zeros((BLOCK_SIZE_M, EMB_DIM), dtype=tl.float32)
+    m_i = tl.full((BLOCK_SIZE_M,), float("-inf"), dtype=tl.float32)
+    l_i = tl.full((BLOCK_SIZE_M,), 1, dtype=tl.float32)
+
     block_min = 0
-    block_max = n_blocks * BLOCK_N
+    if num_full_blocks > 0:
+        block_max = (num_blocks - masked_blocks) * BLOCK_SIZE_N
 
-    if n_full_blocks > 0:
-        block_max = (n_blocks - masked_blocks) * BLOCK_N
-        acc, l_i, m_i = _attention_kernel_inner(
-            acc,
-            l_i,
-            m_i,
+        acc, m_i, l_i = _attention_kernel_inner(
             q,
             k_block_ptr,
             v_block_ptr,
-            start_m,
-            seq_lens_k,
-            seq_lens_q,
+            acc,
+            m_i,
+            l_i,
+            SEQ_LEN_Q,
+            SEQ_LEN_K,
             block_min,
             block_max,
-            0,
-            0,
-            0,
-            False,
-            BLOCK_M,
-            BLOCK_DMODEL,
-            BLOCK_N,
             offs_m,
             offs_n,
-            PRE_LOAD_V,
+            PAD_HEAD,
             False,
-            PADDED_HEAD,
+            False,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
         )
+
         block_min = block_max
-        block_max = n_blocks * BLOCK_N
 
+    block_max = num_blocks * BLOCK_SIZE_N
     if masked_blocks > 0:
-        if IS_CAUSAL:
-            offs_n_causal = offs_n + (seq_lens_q - seq_lens_k)
-        else:
-            offs_n_causal = 0
+        k_block_ptr = tl.advance(k_block_ptr, (0, num_full_blocks * BLOCK_SIZE_N))
+        v_block_ptr = tl.advance(v_block_ptr, (num_full_blocks * BLOCK_SIZE_N, 0))
 
-        k_block_ptr = tl.advance(k_block_ptr, (0, n_full_blocks * BLOCK_N))
-        v_block_ptr = tl.advance(v_block_ptr, (n_full_blocks * BLOCK_N, 0))
-
-        acc, l_i, m_i = _attention_kernel_inner(
-            acc,
-            l_i,
-            m_i,
+        acc, m_i, l_i = _attention_kernel_inner(
             q,
             k_block_ptr,
             v_block_ptr,
-            start_m,
-            seq_lens_k,
-            seq_lens_q,
+            acc,
+            m_i,
+            l_i,
+            SEQ_LEN_Q,
+            SEQ_LEN_K,
             block_min,
             block_max,
-            offs_n_causal,
-            masked_blocks,
-            n_extra_tokens,
-            IS_CAUSAL,
-            BLOCK_M,
-            BLOCK_DMODEL,
-            BLOCK_N,
             offs_m,
             offs_n,
-            PRE_LOAD_V,
-            True,
-            PADDED_HEAD,
+            PAD_HEAD,
+            pad_block_k,
+            IS_CAUSAL,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
         )
 
-    acc = acc / l_i[:, None]
-    end_m_idx = (start_m + 1) * BLOCK_M
-    start_m_idx = start_m * BLOCK_M
-    causal_start_idx = seq_lens_q - seq_lens_k
-    acc = acc.to(o_ptr.type.element_ty)
+    acc /= l_i[:, None]
+
     if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full(
-                (BLOCK_DMODEL,), causal_start_idx, dtype=tl.int32
-            )
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+        causal_start = SEQ_LEN_Q - SEQ_LEN_K
+        if causal_start > offs_m_start and causal_start < offs_m_end:
+            mask = offs_m[:, None] >= tl.full((EMB_DIM,), causal_start, dtype=tl.int32)
+            acc = tl.where(mask, acc, 0)
 
-    l_ptrs = l_ptr + off_z * HQ * MAX_SEQ_LENS_Q + off_h_q * MAX_SEQ_LENS_Q + offs_m
-    overflow_size = end_m_idx - seq_lens_q
-    if overflow_size > 0:
-        boundary = tl.full((BLOCK_M,), BLOCK_M - overflow_size, dtype=tl.int32)
-        l_ptrs_mask = boundary > tl.arange(0, BLOCK_M)
-        tl.store(l_ptrs, m_i + tl.math.log2(l_i), mask=l_ptrs_mask)
-    else:
-        tl.store(l_ptrs, m_i + tl.math.log2(l_i))
-
-    o_offset = (
-        off_z * o_stride_z + cu_seq_lens_q_start * o_stride_m + off_h_q * o_stride_h
-    )
+    o_off = off_z * o_stride_z + off_h_q * o_stride_h
     o_block_ptr = tl.make_block_ptr(
-        base=o_ptr + o_offset,
-        shape=(seq_lens_q, ACTUAL_BLOCK_DMODEL),
+        base=o_ptr + o_off,
+        shape=(SEQ_LEN_Q, ACTUAL_EMB_DIM),
         strides=(o_stride_m, o_stride_n),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        offsets=(offs_m_start, 0),
+        block_shape=(BLOCK_SIZE_M, EMB_DIM),
         order=(1, 0),
     )
-
-    # TODO: Do the boundary check optionally.
-    tl.store(o_block_ptr, acc, boundary_check=(0, 1))
+    tl.store(o_block_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0, 1))
 
 
 class Attention(nn.Module):
@@ -708,58 +616,50 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
 
-        output = type(self)._attention_kernel_helper(
+        output = type(self)._launch_attention_kernel(
             xq,
             keys,
             values,
+            is_causal=True,
             sm_scale=1 / math.sqrt(self.head_dim),
-            causal=True,
         )
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
     @staticmethod
-    def _attention_kernel_helper(q, k, v, sm_scale=1.0, causal=False):
+    def _launch_attention_kernel(q, k, v, is_causal=False, sm_scale=1.0):
         o = torch.empty_like(q, dtype=v.dtype)
 
-        batch, nheads_q, seq_lens_q, head_size = q.shape
-        _, nheads_k, seq_lens_k, _ = k.shape
+        batch_size, num_heads_q, seq_len_q, head_size = q.shape
+        _, num_heads_k, seq_len_k, _ = k.shape
 
-        padded_d_model = max(1 << (head_size - 1).bit_length(), 16)
-
-        m = torch.empty(
-            (batch, nheads_q, seq_lens_q),
-            device=q.device,
-            dtype=torch.float32,
-        )
+        padded_head_size = max(1 << (head_size - 1).bit_length(), 16)
 
         def grid(meta):
             return (
-                triton.cdiv(seq_lens_q, meta["BLOCK_M"]),
-                nheads_q,
-                batch,
+                triton.cdiv(seq_len_q, meta["BLOCK_SIZE_M"]),
+                num_heads_q,
+                batch_size,
             )
 
         attention_kernel[grid](
             q,
             k,
             v,
-            sm_scale,
-            m,
             o,
             *q.stride(),
             *k.stride(),
             *v.stride(),
             *o.stride(),
-            HQ=nheads_q,
-            HK=nheads_k,
-            ACTUAL_BLOCK_DMODEL=head_size,
-            MAX_SEQ_LENS_Q=seq_lens_q,
-            MAX_SEQ_LENS_K=seq_lens_k,
-            IS_CAUSAL=causal,
-            BLOCK_DMODEL=padded_d_model,
-            BATCH_SIZE=q.shape[0],
+            sm_scale=sm_scale,
+            ACTUAL_EMB_DIM=head_size,
+            NUM_HEADS_Q=num_heads_q,
+            NUM_HEADS_K=num_heads_k,
+            SEQ_LEN_Q=seq_len_q,
+            SEQ_LEN_K=seq_len_k,
+            EMB_DIM=padded_head_size,
+            IS_CAUSAL=is_causal,
         )
 
         return o
