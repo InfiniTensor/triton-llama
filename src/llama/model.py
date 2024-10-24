@@ -95,6 +95,203 @@ class RMSNorm(nn.Module):
         return y
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=5,
+            num_warps=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=5,
+            num_warps=2,
+        ),
+    ],
+    key=["m", "n", "k"],
+)
+@triton.jit
+def matmul_kernel(
+    lhs_ptr,
+    rhs_ptr,
+    output_ptr,
+    m,
+    n,
+    k,
+    lhs_stride_z,
+    lhs_stride_m,
+    lhs_stride_k,
+    rhs_stride_z,
+    rhs_stride_k,
+    rhs_stride_n,
+    output_stride_z,
+    output_stride_m,
+    output_stride_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_z = tl.program_id(1)
+    num_pid_m = tl.cdiv(m, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(n, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    lhs_off_z = pid_z * lhs_stride_z
+    rhs_off_z = pid_z * rhs_stride_z
+    lhs_offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m
+    rhs_offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % n
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    lhs_ptrs = (
+        lhs_ptr
+        + lhs_off_z
+        + lhs_offs_m[:, None] * lhs_stride_m
+        + offs_k[None, :] * lhs_stride_k
+    )
+    rhs_ptrs = (
+        rhs_ptr
+        + rhs_off_z
+        + offs_k[:, None] * rhs_stride_k
+        + rhs_offs_n[None, :] * rhs_stride_n
+    )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
+        lhs = tl.load(lhs_ptrs, mask=offs_k[None, :] < k - i * BLOCK_SIZE_K, other=0.0)
+        rhs = tl.load(rhs_ptrs, mask=offs_k[:, None] < k - i * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(lhs, rhs, accumulator)
+        lhs_ptrs += BLOCK_SIZE_K * lhs_stride_k
+        rhs_ptrs += BLOCK_SIZE_K * rhs_stride_k
+    output = accumulator.to(tl.float16)
+
+    output_off_z = pid_z * output_stride_z
+    output_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    output_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    output_ptrs = (
+        output_ptr
+        + output_off_z
+        + output_stride_m * output_offs_m[:, None]
+        + output_stride_n * output_offs_n[None, :]
+    )
+    output_mask = (output_offs_m[:, None] < m) & (output_offs_n[None, :] < n)
+    tl.store(output_ptrs, output, mask=output_mask)
+
+
+def matmul(lhs, rhs):
+    batch_dims = torch.broadcast_shapes(lhs.shape[:-2], rhs.shape[:-2])
+
+    output = torch.empty(
+        (*batch_dims, lhs.shape[-2], rhs.shape[-1]),
+        device=lhs.device,
+        dtype=torch.float16,
+    )
+
+    batch_size = math.prod(batch_dims)
+
+    def grid(meta):
+        return (
+            triton.cdiv(lhs.shape[-2], meta["BLOCK_SIZE_M"])
+            * triton.cdiv(rhs.shape[-1], meta["BLOCK_SIZE_N"]),
+            batch_size,
+        )
+
+    matmul_kernel[grid](
+        lhs,
+        rhs,
+        output,
+        lhs.shape[-2],
+        rhs.shape[-1],
+        lhs.shape[-1],
+        lhs.stride(-3) if lhs.ndim >= 3 else 0,
+        lhs.stride(-2),
+        lhs.stride(-1),
+        rhs.stride(-3) if rhs.ndim >= 3 else 0,
+        rhs.stride(-2),
+        rhs.stride(-1),
+        output.stride(-3) if output.ndim >= 3 else 0,
+        output.stride(-2),
+        output.stride(-1),
+    )
+
+    return output
+
+
 class Linear(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -106,7 +303,7 @@ class Linear(nn.Module):
         nn.init.uniform_(self.weight, -bound, bound)
 
     def forward(self, x):
-        return torch.matmul(x, self.weight.t())
+        return matmul(x, self.weight.t())
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
