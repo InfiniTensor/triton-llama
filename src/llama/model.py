@@ -95,6 +95,20 @@ class RMSNorm(nn.Module):
         return y
 
 
+class Linear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+
+        k = 1 / in_features
+        bound = math.sqrt(k)
+        nn.init.uniform_(self.weight, -bound, bound)
+
+    def forward(self, x):
+        return torch.matmul(x, self.weight.t())
+
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -496,10 +510,10 @@ class Attention(nn.Module):
             n_local_kv_heads (int): Number of local key and value heads.
             n_rep (int): Number of repetitions for local heads.
             head_dim (int): Dimension size of each attention head.
-            wq (nn.Linear): Linear transformation for queries.
-            wk (nn.Linear): Linear transformation for keys.
-            wv (nn.Linear): Linear transformation for values.
-            wo (nn.Linear): Linear transformation for output.
+            wq (Linear): Linear transformation for queries.
+            wk (Linear): Linear transformation for keys.
+            wv (Linear): Linear transformation for values.
+            wo (Linear): Linear transformation for output.
             cache_k (torch.Tensor): Cached keys for attention.
             cache_v (torch.Tensor): Cached values for attention.
 
@@ -512,10 +526,10 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wq = Linear(args.dim, args.n_heads * self.head_dim)
+        self.wk = Linear(args.dim, self.n_kv_heads * self.head_dim)
+        self.wv = Linear(args.dim, self.n_kv_heads * self.head_dim)
+        self.wo = Linear(args.n_heads * self.head_dim, args.dim)
 
         self.cache_k = torch.zeros(
             (
@@ -653,9 +667,9 @@ class FeedForward(nn.Module):
             ffn_dim_multiplier (float, optional): Custom multiplier for hidden dimension. Defaults to None.
 
         Attributes:
-            w1 (nn.Linear): Linear transformation for the first layer.
-            w2 (nn.Linear): Linear transformation for the second layer.
-            w3 (nn.Linear): Linear transformation for the third layer.
+            w1 (Linear): Linear transformation for the first layer.
+            w2 (Linear): Linear transformation for the second layer.
+            w3 (Linear): Linear transformation for the third layer.
 
         """
         super().__init__()
@@ -665,9 +679,9 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = Linear(dim, hidden_dim)
+        self.w2 = Linear(hidden_dim, dim)
+        self.w3 = Linear(dim, hidden_dim)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -748,7 +762,7 @@ class Transformer(nn.Module):
             tok_embeddings (nn.Embedding): Token embeddings.
             layers (nn.ModuleList): List of Transformer blocks.
             norm (RMSNorm): Layer normalization for the model output.
-            output (nn.Linear): Linear layer for final output.
+            output (Linear): Linear layer for final output.
             freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
 
         """
@@ -764,7 +778,7 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.output = Linear(params.dim, params.vocab_size)
 
         self.freqs_cis = precompute_freqs_cis(
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
